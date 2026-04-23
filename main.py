@@ -44,3 +44,10 @@ async def health_stream():
             yield f"data: {json.dumps(data)}\n\n"
             time.sleep(60) # 每分钟更新一次
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    # Zeabur 会自动注入 PORT 环境变量，默认回退到 8000
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

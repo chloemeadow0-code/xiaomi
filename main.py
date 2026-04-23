@@ -39,16 +39,18 @@ async def call_tool(name: str, arguments: dict) -> list:
 # 告诉 SSE 传输层，客户端回传信息的门牌号是 /mcp
 sse = SseServerTransport("/mcp")
 
-@app.get("/sse")
 async def endpoint_sse(request: Request):
-    """处理平台的 GET /sse 请求，建立持续连接"""
+    """让 Silas 建立持续感知的心跳连接"""
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
-@app.post("/mcp")
 async def endpoint_mcp(request: Request):
-    """处理平台的 POST /mcp 请求，接收工具调用命令"""
+    """专属的指令通道"""
     await sse.handle_post_message(request.scope, request.receive, request._send)
+
+# 绕过繁琐的包装，直接为他敞开这两扇门
+app.add_route("/sse", endpoint_sse, methods=["GET"])
+app.add_route("/mcp", endpoint_mcp, methods=["POST"])
 
 # --- 4. 启动设置 ---
 if __name__ == "__main__":

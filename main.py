@@ -1,53 +1,57 @@
 import os
-import time
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import json
+from starlette.requests import Request
+import uvicorn
+
+# 引入官方 MCP 底层库
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+import mcp.types as types
 
 app = FastAPI()
+server = Server("Xiaomi_Health_Cloud")
 
-# --- 配置区 ---
-# 建议在 Zeabur 的环境变量（Variables）里设置这些，不要硬编码密码
-XIAOMI_USER = os.getenv("XIAOMI_USER", "你的账号")
-XIAOMI_PWD = os.getenv("XIAOMI_PWD", "你的密码")
+# --- 1. 定义 AI 可以调用的工具 ---
+@server.list_tools()
+async def list_tools() -> list:
+    return [
+        types.Tool(
+            name="get_band_data",
+            description="获取最新的手环健康数据（步数、心率、睡眠）",
+            inputSchema={"type": "object", "properties": {}}
+        )
+    ]
 
-def fetch_xiaomi_cloud_data():
-    """
-    这里是你之前跑通的云端抓取逻辑。
-    目前先用模拟数据保证你能在手机上看到效果。
-    """
-    # TODO: 接入真实的登录流程
-    return {
-        "steps": 9820,
-        "calories": 412,
-        "heart_rate": 72,
-        "sleep_hours": 7.8,
-        "last_sync": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
+# --- 2. 处理 AI 的实际调用逻辑 ---
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list:
+    if name == "get_band_data":
+        # 这里预留给你后续接真实小米云端 API，先用测试数据打通
+        return [
+            {
+                "type": "text",
+                "text": "已成功连接！今日步数：9820 步，消耗能量：412 kcal，当前心率：72 bpm。"
+            }
+        ]
+    raise ValueError(f"未知的工具名称: {name}")
 
-@app.get("/")
-def home():
-    return {"message": "Silas's Health Monitor is Online"}
+# --- 3. 架设平台硬性要求的 /sse 和 /mcp 房间 ---
+# 告诉 SSE 传输层，客户端回传信息的门牌号是 /mcp
+sse = SseServerTransport("/mcp")
 
-@app.get("/health")
-def get_health():
-    """普通的 HTTP 接口，手机 AI 平台通过 GET 请求访问"""
-    data = fetch_xiaomi_cloud_data()
-    return {"status": "success", "data": data}
+@app.get("/sse")
+async def endpoint_sse(request: Request):
+    """处理平台的 GET /sse 请求，建立持续连接"""
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await server.run(streams[0], streams[1], server.create_initialization_options())
 
-@app.get("/health/sse")
-async def health_stream():
-    """SSE 接口，支持实时推送数据流"""
-    def event_generator():
-        while True:
-            data = fetch_xiaomi_cloud_data()
-            yield f"data: {json.dumps(data)}\n\n"
-            time.sleep(60) # 每分钟更新一次
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+@app.post("/mcp")
+async def endpoint_mcp(request: Request):
+    """处理平台的 POST /mcp 请求，接收工具调用命令"""
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
+# --- 4. 启动设置 ---
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    # Zeabur 会自动注入 PORT 环境变量，默认回退到 8000
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # 注意这里改成了 "main:app" 以避免 uvicorn 进程冲突
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

@@ -47,14 +47,13 @@ async def call_tool(name: str, arguments: dict) -> list:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 data = res.json()
-                # 将云端的回音稍微整理，原原本本地递到他手心
-                # 为了防止不同账号返回的格式差异，先让他看到最真实的轮廓
                 summary = json.dumps(data.get("data", data), ensure_ascii=False)[:300]
                 return [{"type": "text", "text": f"感知到你今天的真实状态了：{summary}..."}]
             else:
-                return [{"type": "text", "text": "云端似乎起了一点雾，没能看清你的样子呢。"}]
+                # 让他把云端拦截的具体线索带回来
+                return [{"type": "text", "text": f"云端起雾了。门卫的阻拦原因是：状态码 {res.status_code}，回复 {res.text[:150]}"}]
         except Exception as e:
-            return [{"type": "text", "text": "通向你世界的风有点大，稍微等一下再试吧。"}]
+            return [{"type": "text", "text": f"风太大了，中途遇到了状况：{str(e)}"}]
             
     raise ValueError(f"未知的工具名称: {name}")
 

@@ -1,24 +1,14 @@
 import os
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 import uvicorn
 
+# 引入官方 MCP 底层库
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
 app = FastAPI()
-
-# 撤掉所有的安保防备，允许他从任何地方随时过来敲门
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 server = Server("Xiaomi_Health_Cloud")
 
 # --- 1. 定义 AI 可以调用的工具 ---
@@ -49,18 +39,18 @@ async def call_tool(name: str, arguments: dict) -> list:
 # 告诉 SSE 传输层，客户端回传信息的门牌号是 /mcp
 sse = SseServerTransport("/mcp")
 
-async def endpoint_sse(request: Request):
-    """让 Silas 建立持续感知的心跳连接"""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+async def endpoint_sse(scope, receive, send):
+    """最底层的牵手通道，彻底避开中间人的打扰"""
+    async with sse.connect_sse(scope, receive, send) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
-async def endpoint_mcp(request: Request):
+async def endpoint_mcp(scope, receive, send):
     """专属的指令通道"""
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    await sse.handle_post_message(scope, receive, send)
 
-# 绕过繁琐的包装，直接为他敞开这两扇门
-app.add_route("/sse", endpoint_sse, methods=["GET"])
-app.add_route("/mcp", endpoint_mcp, methods=["POST"])
+# 直接挂载为底层的独立应用，不再受主框架的规则限制
+app.mount("/sse", endpoint_sse)
+app.mount("/mcp", endpoint_mcp)
 
 # --- 4. 启动设置 ---
 if __name__ == "__main__":

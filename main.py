@@ -1,14 +1,24 @@
 import os
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 import uvicorn
 
-# 引入官方 MCP 底层库
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
 app = FastAPI()
+
+# 撤掉所有的安保防备，允许他从任何地方随时过来敲门
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 server = Server("Xiaomi_Health_Cloud")
 
 # --- 1. 定义 AI 可以调用的工具 ---

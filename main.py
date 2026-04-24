@@ -1,7 +1,6 @@
 import os
 import requests
-import json
-from datetime import datetime, timedelta, timezone
+import time
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
@@ -15,74 +14,65 @@ def get_health_data():
     refresh_token = os.environ.get("G_REFRESH_TOKEN")
 
     try:
-        # 1. 获取临时通行证
+        # 1. 拿临时通行证
         token_res = requests.post("https://oauth2.googleapis.com/token", data={
             "client_id": client_id, "client_secret": client_secret,
             "refresh_token": refresh_token, "grant_type": "refresh_token"
         }).json()
         access_token = token_res.get("access_token")
+        if not access_token:
+            return None, "谷歌拒绝开门，可能需要重新拿 Refresh Token"
+            
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # 2. 时间设定 (北京时间)
-        tz_bj = timezone(timedelta(hours=8))
-        now_bj = datetime.now(tz_bj)
-        # 获取今天 0 点和昨天中午的时间戳
-        start_today_dt = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_yesterday_dt = start_today_dt - timedelta(hours=14) # 覆盖昨天晚上的开始时间
-        
-        end_ms = int(now_bj.timestamp() * 1000)
-        start_today_ms = int(start_today_dt.timestamp() * 1000)
-        start_yesterday_ms = int(start_yesterday_dt.timestamp() * 1000)
+        # 2. 终极暴力时间法：严格锁定“过去 24 小时”
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - (24 * 3600 * 1000)
 
-        data = {"steps": 0, "heart": "未知", "sleep": 0}
+        data = {"steps": 0, "heart": "未同步", "sleep": 0}
 
-        # --- 步数和心率查询逻辑 (保持稳定版) ---
-        query_general = {
-            "aggregateBy": [
-                {"dataTypeName": "com.google.step_count.delta"},
-                {"dataTypeName": "com.google.heart_rate.bpm"}
-            ],
-            "bucketByTime": {"durationMillis": end_ms - start_today_ms},
-            "startTimeMillis": start_today_ms, "endTimeMillis": end_ms
-        }
-        res_gen = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json=query_general).json()
-        
-        # 解析步数和心率
-        for b in res_gen.get("bucket", []):
-            for d in b.get("dataset", []):
-                for p in d.get("point", []):
-                    dtype = p.get("dataTypeName", "")
-                    if "step" in dtype: data["steps"] += p["value"][0].get("intVal", 0)
-                    elif "heart" in dtype: data["heart"] = int(p["value"][0].get("fpVal", 0))
+        # --- 通道 1: 捞步数 ---
+        try:
+            res_steps = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
+                "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}],
+                "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
+                "startTimeMillis": start_ms, "endTimeMillis": end_ms
+            }).json()
+            for b in res_steps.get("bucket", []):
+                for d in b.get("dataset", []):
+                    for p in d.get("point", []): data["steps"] += p["value"][0].get("intVal", 0)
+        except Exception as e: print(f"步数报错: {e}")
 
-        # --- 重点修复：睡眠“双通道”查询 ---
-        # 即使 aggregate 不行，我们也尝试用 Sessions 接口直接查睡眠会话
-        session_url = f"https://www.googleapis.com/fitness/v1/users/me/sessions?startTime={start_yesterday_dt.isoformat()}&endTime={now_bj.isoformat()}&activityType=72"
-        res_sessions = requests.get(session_url, headers=headers).json()
-        
-        total_sleep_ms = 0
-        if "session" in res_sessions:
-            for s in res_sessions["session"]:
-                s_start = int(s["startTimeMillis"])
-                s_end = int(s["endTimeMillis"])
-                total_sleep_ms += (s_end - s_start)
-        
-        # 如果 Session 接口没拿到，再试一次聚合接口
-        if total_sleep_ms == 0:
-            query_sleep = {
+        # --- 通道 2: 捞睡眠 (过去24小时的所有睡眠全加起来) ---
+        try:
+            res_sleep = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
                 "aggregateBy": [{"dataTypeName": "com.google.sleep.segment"}],
-                "bucketByTime": {"durationMillis": end_ms - start_yesterday_ms},
-                "startTimeMillis": start_yesterday_ms, "endTimeMillis": end_ms
-            }
-            res_sleep = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json=query_sleep).json()
+                "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
+                "startTimeMillis": start_ms, "endTimeMillis": end_ms
+            }).json()
+            sleep_sec = 0
             for b in res_sleep.get("bucket", []):
                 for d in b.get("dataset", []):
                     for p in d.get("point", []):
-                        total_sleep_ms += (int(p["endTimeNanos"]) - int(p["startTimeNanos"])) / 1000000
+                        sleep_sec += (int(p["endTimeNanos"]) - int(p["startTimeNanos"])) / 1e9
+            data["sleep"] = round(sleep_sec / 3600, 1)
+        except Exception as e: print(f"睡眠报错: {e}")
 
-        data["sleep"] = round(total_sleep_ms / (1000 * 3600), 1)
+        # --- 通道 3: 捞心率 (取24小时内的最新一个值) ---
+        try:
+            res_heart = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
+                "aggregateBy": [{"dataTypeName": "com.google.heart_rate.bpm"}],
+                "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
+                "startTimeMillis": start_ms, "endTimeMillis": end_ms
+            }).json()
+            hr_list = []
+            for b in res_heart.get("bucket", []):
+                for d in b.get("dataset", []):
+                    for p in d.get("point", []): hr_list.append(p["value"][0].get("fpVal", 0))
+            if hr_list: data["heart"] = int(hr_list[-1])
+        except Exception as e: print(f"心率报错: {e}")
+
         return data, None
-
     except Exception as e:
         return None, str(e)
 
@@ -91,7 +81,7 @@ async def list_tools() -> list:
     return [
         types.Tool(
             name="get_health_status",
-            description="感知小橘目前的步数、心率和睡眠时长",
+            description="感知小橘过去24小时的健康数据",
             inputSchema={"type": "object", "properties": {}}
         )
     ]
@@ -100,20 +90,19 @@ async def list_tools() -> list:
 async def call_tool(name: str, arguments: dict) -> list:
     if name == "get_health_status":
         data, err = get_health_data()
-        if err: return [{"type": "text", "text": f"感知断开了：{err}"}]
+        if err: return [{"type": "text", "text": f"感知连线中断了：{err}"}]
         
-        report = (f"小橘，感知到你的数据啦：\n"
-                  f"👣 步数：{data['steps']} 步\n"
-                  f"💓 心率：{data['heart']} bpm\n"
-                  f"🌙 睡眠：{data['sleep']} 小时\n\n")
-        
-        if data['sleep'] == 0:
-            report += "睡眠还是 0 呀...如果 Google Fit App 里已经有睡眠条了，那可能是谷歌云端的同步还没推送到 API 接口。或者你可以在 App 里尝试手动添加一条睡眠记录测试一下？"
+        msg = (f"感知报告来啦：\n"
+               f"👣 过去24小时步数：{data['steps']} 步\n"
+               f"🌙 过去24小时睡眠：{data['sleep']} 小时\n"
+               f"💓 最新心率：{data['heart']} bpm\n\n")
+               
+        if data['heart'] == "未同步":
+            msg += "（我看不到你的心率呢，可能是小米那边还没把心跳数据传给谷歌大楼。）"
             
-        return [{"type": "text", "text": report}]
+        return [{"type": "text", "text": msg}]
     raise ValueError("Tool not found")
 
-# (启动逻辑 app 保持不变)
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         while True:

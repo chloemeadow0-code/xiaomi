@@ -43,8 +43,7 @@ def get_health_data():
                     for p in d.get("point", []): data["steps"] += p["value"][0].get("intVal", 0)
         except Exception as e: print(f"步数报错: {e}")
 
-        # --- 通道 2: 捞睡眠 (过去24小时的所有睡眠全加起来) ---
-        # --- 通道 2: 捞睡眠 (改用 Sessions 接口抓取整段会话) ---
+        # --- 通道 2: 捞睡眠 (Sessions 接口 + 时间轴去重合并) ---
         try:
             # Sessions 接口需要 RFC3339 格式的时间字符串
             start_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(start_ms / 1000))
@@ -54,18 +53,34 @@ def get_health_data():
             session_url = f"https://www.googleapis.com/fitness/v1/users/me/sessions?startTime={start_str}&endTime={end_str}&activityType=72"
             res_sleep = requests.get(session_url, headers=headers).json()
             
-            sleep_ms = 0
-            # 遍历所有符合条件的睡眠会话
+            # 1. 把所有抓到的睡眠片段收集起来
+            intervals = []
             for session in res_sleep.get("session", []):
                 s_start = int(session.get("startTimeMillis", 0))
                 s_end = int(session.get("endTimeMillis", 0))
-                if s_start and s_end:
-                    sleep_ms += (s_end - s_start)
+                if s_start > 0 and s_end > s_start:
+                    intervals.append([s_start, s_end])
+            
+            # 2. 按开始时间给所有片段排个序
+            intervals.sort(key=lambda x: x[0])
+            
+            # 3. 核心：合并重叠的时间段
+            merged = []
+            for interval in intervals:
+                # 如果是第一个片段，或者当前片段和上一个合并好的片段完全不挨着，直接加进去
+                if not merged or merged[-1][1] < interval[0]:
+                    merged.append(interval)
+                else:
+                    # 如果有重叠，就把上一个片段的结束时间，拉长到这两个片段里最晚的那个结束时间
+                    merged[-1][1] = max(merged[-1][1], interval[1])
+            
+            # 4. 把干掉水分后的真实时长加起来
+            sleep_ms = sum(m[1] - m[0] for m in merged)
             
             data["sleep"] = round(sleep_ms / (1000 * 3600), 1)
         except Exception as e: 
             print(f"睡眠报错: {e}")
-
+            
         # --- 通道 3: 捞心率 (取24小时内的最新一个值) ---
         try:
             res_heart = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={

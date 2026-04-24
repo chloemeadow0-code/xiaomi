@@ -120,7 +120,9 @@ async def call_tool(name: str, arguments: dict) -> list:
         msg = (f"感知报告来啦：\n"
                f"👣 过去24小时步数：{data['steps']} 步\n"
                f"🌙 过去24小时睡眠：{data['sleep']} 小时\n"
-               f"💓 最新心率：{data['heart']} bpm\n\n")
+               f"   (详细时段：{data.get('sleep_segments', '无')})\n"
+               f"💓 最新心率：{data['heart']} bpm\n"
+               f"   (测量时间：{data.get('heart_time', '未知')})\n\n")
                
         if data['heart'] == "未同步":
             msg += "（我看不到你的心率呢，可能是小米那边还没把心跳数据传给谷歌大楼。）"

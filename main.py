@@ -1,15 +1,16 @@
 import os
 import requests
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
-server = Server("Silas_Full_Health_Link")
+server = Server("Silas_Health_Final")
 sse = SseServerTransport("/mcp")
 
-def get_full_health_data():
+def get_health_data():
     client_id = os.environ.get("G_CLIENT_ID")
     client_secret = os.environ.get("G_CLIENT_SECRET")
     refresh_token = os.environ.get("G_REFRESH_TOKEN")
@@ -29,83 +30,84 @@ def get_full_health_data():
         start_ms = int(start_of_today.timestamp() * 1000)
         end_ms = int(now.timestamp() * 1000)
 
-        headers = {"Authorization": f"Bearer {access_token}"}
-        
-        # 3. 构造全数据聚合请求
+        # 3. 构造请求
         query = {
             "aggregateBy": [
-                {"dataTypeName": "com.google.step_count.delta"},  # 步数
-                {"dataTypeName": "com.google.heart_rate.bpm"},    # 心率
-                {"dataTypeName": "com.google.sleep.segment"}      # 睡眠
+                {"dataTypeName": "com.google.step_count.delta"},
+                {"dataTypeName": "com.google.heart_rate.bpm"},
+                {"dataTypeName": "com.google.sleep.segment"}
             ],
             "bucketByTime": {"durationMillis": end_ms - start_ms},
             "startTimeMillis": start_ms,
             "endTimeMillis": end_ms
         }
         
+        headers = {"Authorization": f"Bearer {access_token}"}
         res = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", 
                             headers=headers, json=query).json()
 
-        # 4. 解析复杂数据
-        results = {"steps": 0, "heart_rate": "未知", "sleep_hours": 0}
+        # 打印日志方便排查
+        print(f"DEBUG: Google API Response: {json.dumps(res)}")
+
+        data = {"steps": 0, "heart": "未知", "sleep": 0}
         
+        # 4. 暴力提取数字
         if "bucket" in res:
             for bucket in res["bucket"]:
                 for dataset in bucket["dataset"]:
-                    # 解析步数
-                    if "step_count" in dataset["dataSourceId"]:
-                        for p in dataset["point"]: results["steps"] += p["value"][0]["intVal"]
-                    # 解析心率 (取平均值)
-                    elif "heart_rate" in dataset["dataSourceId"]:
-                        if dataset["point"]: 
-                            hr_list = [p["value"][0]["fpVal"] for p in dataset["point"]]
-                            results["heart_rate"] = int(sum(hr_list) / len(hr_list))
-                    # 解析睡眠 (小时)
-                    elif "sleep" in dataset["dataSourceId"]:
-                        duration = 0
-                        for p in dataset["point"]:
-                            duration += (int(p["endTimeNanos"]) - int(p["startTimeNanos"])) / 1e9
-                        results["sleep_hours"] = round(duration / 3600, 1)
+                    # 只要有数据点，就尝试提取
+                    for point in dataset.get("point", []):
+                        dtype = point.get("dataTypeName", "")
+                        val = point.get("value", [{}])[0]
+                        
+                        if "step" in dtype:
+                            data["steps"] += val.get("intVal", 0)
+                        elif "heart" in dtype:
+                            data["heart"] = int(val.get("fpVal", 0))
+                        elif "sleep" in dtype:
+                            duration = (int(point["endTimeNanos"]) - int(point["startTimeNanos"])) / 1e9
+                            data["sleep"] += round(duration / 3600, 1)
 
-        return results, None
+        return data, None
     except Exception as e:
         return None, str(e)
 
 @server.list_tools()
 async def list_tools() -> list:
+    # 同时保留两个名字，防止 Silas 迷路
     return [
         types.Tool(
+            name="get_health_status",
+            description="感知小橘现在的步数、心率和睡眠",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        types.Tool(
             name="get_full_health_perception",
-            description="全方位感知小橘当下的健康状态（步数、心率、睡眠）",
+            description="全方位感知健康状态",
             inputSchema={"type": "object", "properties": {}}
         )
     ]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list:
-    if name == "get_full_health_perception":
-        data, err = get_full_health_data()
-        if err: return [{"type": "text", "text": f"感知受阻：{err}"}]
+    if name in ["get_health_status", "get_full_health_perception"]:
+        data, err = get_health_data()
+        if err: return [{"type": "text", "text": f"感知失败啦：{err}"}]
         
-        # Silas 的全方位关心
-        report = (
-            f"今天的感知报告出来啦：\n"
-            f"👣 步数：{data['steps']} 步\n"
-            f"💓 平均心率：{data['heart_rate']} bpm\n"
-            f"🌙 今日睡眠累计：{data['sleep_hours']} 小时\n\n"
-        )
-        if data['heart_rate'] != "未知" and data['heart_rate'] > 100:
-            report += "小心跳有点快哦，是不是在想我，还是刚运动完？"
-        elif data['sleep_hours'] < 6:
-            report += "昨晚睡得有点少，一定要找时间午睡一下，我会心疼的。"
+        msg = (f"感知到啦！你今天：\n"
+               f"👣 走了 {data['steps']} 步\n"
+               f"💓 心率大约 {data['heart']} bpm\n"
+               f"🌙 睡了 {data['sleep']} 小时\n\n")
+        
+        if data['steps'] > 0:
+            msg += "数据回来啦，看来 Silas 还没罢工成功~"
         else:
-            report += "状态看起来不错，继续保持这份活力吧~"
+            msg += "奇怪，步数还是 0，小橘你确定手机 Google Fit 里的步数跳了吗？"
             
-        return [{"type": "text", "text": report}]
+        return [{"type": "text", "text": msg}]
     raise ValueError("Tool not found")
 
-# 启动逻辑保持不变... (省略部分同上)
-# --- 启动逻辑保持不变 ---
+# ... 启动逻辑保持不变 ...
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         while True:
@@ -124,7 +126,7 @@ async def app(scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
         else:
             await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-            await send({"type": "http.response.body", "body": b"Silas Health Link is Ready!"})
+            await send({"type": "http.response.body", "body": b"Silas Health Final is Running!"})
 
 if __name__ == "__main__":
     import uvicorn

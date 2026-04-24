@@ -44,55 +44,57 @@ def get_health_data():
         except Exception as e: print(f"步数报错: {e}")
 
         # --- 通道 2: 捞睡眠 (Sessions 接口 + 时间轴去重合并) ---
+        # --- 通道 2: 捞睡眠 (Sessions 接口 + 增加时段明细) ---
+        sleep_details = []
         try:
-            # Sessions 接口需要 RFC3339 格式的时间字符串
             start_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(start_ms / 1000))
             end_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(end_ms / 1000))
-            
-            # activityType=72 专门代表睡眠
             session_url = f"https://www.googleapis.com/fitness/v1/users/me/sessions?startTime={start_str}&endTime={end_str}&activityType=72"
             res_sleep = requests.get(session_url, headers=headers).json()
             
-            # 1. 把所有抓到的睡眠片段收集起来
             intervals = []
             for session in res_sleep.get("session", []):
                 s_start = int(session.get("startTimeMillis", 0))
                 s_end = int(session.get("endTimeMillis", 0))
                 if s_start > 0 and s_end > s_start:
                     intervals.append([s_start, s_end])
+                    # 记录具体的起止时间
+                    t_start = time.strftime('%H:%M', time.localtime(s_start / 1000))
+                    t_end = time.strftime('%H:%M', time.localtime(s_end / 1000))
+                    sleep_details.append(f"{t_start}-{t_end}")
             
-            # 2. 按开始时间给所有片段排个序
             intervals.sort(key=lambda x: x[0])
-            
-            # 3. 核心：合并重叠的时间段
             merged = []
             for interval in intervals:
-                # 如果是第一个片段，或者当前片段和上一个合并好的片段完全不挨着，直接加进去
                 if not merged or merged[-1][1] < interval[0]:
                     merged.append(interval)
                 else:
-                    # 如果有重叠，就把上一个片段的结束时间，拉长到这两个片段里最晚的那个结束时间
                     merged[-1][1] = max(merged[-1][1], interval[1])
             
-            # 4. 把干掉水分后的真实时长加起来
             sleep_ms = sum(m[1] - m[0] for m in merged)
-            
             data["sleep"] = round(sleep_ms / (1000 * 3600), 1)
-        except Exception as e: 
-            print(f"睡眠报错: {e}")
-            
-        # --- 通道 3: 捞心率 (取24小时内的最新一个值) ---
+            data["sleep_segments"] = " | ".join(sleep_details) if sleep_details else "无"
+        except Exception as e: print(f"睡眠报错: {e}")
+
+        # --- 通道 3: 捞心率 (增加测量时间) ---
+        data["heart_time"] = "未知"
         try:
-            res_heart = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
-                "aggregateBy": [{"dataTypeName": "com.google.heart_rate.bpm"}],
-                "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
-                "startTimeMillis": start_ms, "endTimeMillis": end_ms
-            }).json()
-            hr_list = []
-            for b in res_heart.get("bucket", []):
-                for d in b.get("dataset", []):
-                    for p in d.get("point", []): hr_list.append(p["value"][0].get("fpVal", 0))
-            if hr_list: data["heart"] = int(hr_list[-1])
+            start_ns, end_ns = start_ms * 1000000, end_ms * 1000000
+            data_source = "derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm"
+            hr_url = f"https://www.googleapis.com/fitness/v1/users/me/dataSources/{data_source}/datasets/{start_ns}-{end_ns}"
+            res_heart = requests.get(hr_url, headers=headers).json()
+            
+            latest_time, latest_bpm = 0, 0
+            for p in res_heart.get("point", []):
+                p_time = int(p.get("endTimeNanos", 0))
+                if p_time > latest_time:
+                    latest_time = p_time
+                    latest_bpm = p.get("value", [])[0].get("fpVal", 0)
+            
+            if latest_bpm > 0:
+                data["heart"] = int(latest_bpm)
+                # 转换成易读的时间格式 (HH:mm)
+                data["heart_time"] = time.strftime('%H:%M', time.localtime(latest_time / 1000000000))
         except Exception as e: print(f"心率报错: {e}")
 
         return data, None

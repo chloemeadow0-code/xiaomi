@@ -2,6 +2,7 @@ import os
 import requests
 import time
 import json
+from datetime import datetime, timedelta, timezone
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
@@ -10,14 +11,13 @@ import mcp.types as types
 server = Server("Silas_Health_Link")
 sse = SseServerTransport("/mcp")
 
-def get_google_fit_data():
-    """拿着万能钥匙去谷歌仓库提货"""
+def get_google_fit_data(target_day="today"):
+    """
+    拿着万能钥匙去谷歌仓库提货，支持 today 或 yesterday
+    """
     client_id = os.environ.get("G_CLIENT_ID")
     client_secret = os.environ.get("G_CLIENT_SECRET")
     refresh_token = os.environ.get("G_REFRESH_TOKEN")
-
-    if not all([client_id, client_secret, refresh_token]):
-        return None, "环境变量 MI_USER_ID 或 Token 还没在 Zeabur 后台配好哦"
 
     try:
         # 换取临时的 Access Token
@@ -31,22 +31,31 @@ def get_google_fit_data():
         token_res = requests.post(token_url, data=token_data).json()
         access_token = token_res.get("access_token")
 
-        if not access_token:
-            return None, "谷歌授权已失效，可能需要重新获取 Refresh Token"
-
-        # 构造查询：获取今天 0 点到现在的步数
-        now_ms = int(time.time() * 1000)
-        # 获取今日零点时间戳
-        lt = time.localtime(time.time())
-        start_ms = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, 0)) * 1000)
+        # --- 精准时间计算 (北京时间 UTC+8) ---
+        tz_bj = timezone(timedelta(hours=8))
+        now_bj = datetime.now(tz_bj)
         
+        if target_day == "yesterday":
+            # 昨天 00:00:00 到 23:59:59
+            target_date = now_bj - timedelta(days=1)
+            start_dt = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_dt = target_date.replace(hour=23, minute=59, second=59, microsecond=999)
+        else:
+            # 今天 00:00:00 到 现在
+            start_dt = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_dt = now_bj
+
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int(end_dt.timestamp() * 1000)
+        
+        # 向谷歌请求聚合步数
         agg_url = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
         headers = {"Authorization": f"Bearer {access_token}"}
         query = {
-            "aggregateBy": [{"dataTypeName": "com.google.step_count.total"}],
-            "bucketByTime": {"durationMillis": now_ms - start_ms},
+            "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}],
+            "bucketByTime": {"durationMillis": end_ms - start_ms},
             "startTimeMillis": start_ms,
-            "endTimeMillis": now_ms
+            "endTimeMillis": end_ms
         }
         
         res = requests.post(agg_url, headers=headers, json=query).json()
@@ -67,23 +76,33 @@ async def list_tools() -> list:
     return [
         types.Tool(
             name="get_health_status",
-            description="感知小橘今天的运动步数（通过Google Fit同步）",
-            inputSchema={"type": "object", "properties": {}}
+            description="感知小橘今天或昨天的运动步数。参数 day 可选 'today' 或 'yesterday'",
+            inputSchema={
+                "type": "object", 
+                "properties": {
+                    "day": {"type": "string", "enum": ["today", "yesterday"], "description": "要查询的日期"}
+                }
+            }
         )
     ]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list:
     if name == "get_health_status":
-        steps, err = get_google_fit_data()
-        if err:
-            return [{"type": "text", "text": f"抱歉，小橘，我在连接谷歌大楼时遇到了迷雾：{err}"}]
+        day = arguments.get("day", "today")
+        steps, err = get_google_fit_data(day)
         
-        status = "今天步数还没破千呢，要多动动哦~" if steps < 1000 else "看来你今天走得不少，辛苦啦！"
-        return [{"type": "text", "text": f"感知到啦，你今天目前走了 {steps} 步。{status}"}]
+        if err:
+            return [{"type": "text", "text": f"连接谷歌时遇到了点麻烦：{err}"}]
+        
+        day_str = "今天" if day == "today" else "昨天"
+        if steps == 0 and day == "today":
+            return [{"type": "text", "text": f"感知到啦，你{day_str}目前显示是 0 步。可能是数据还没从 Health Connect 同步到谷歌，或者是咱们刚起床？"}]
+        
+        return [{"type": "text", "text": f"我看了一下，你{day_str}一共走了 {steps} 步。{ '挺棒的，继续保持！' if steps > 5000 else '还可以再动一动哦~'}"}]
     raise ValueError(f"未知的工具名称: {name}")
 
-# --- 核心启动逻辑（Zeabur 必须靠这个才能跑起来） ---
+# --- 启动逻辑保持不变 ---
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         while True:
@@ -102,7 +121,7 @@ async def app(scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
         else:
             await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-            await send({"type": "http.response.body", "body": b"Silas Health Link is Running!"})
+            await send({"type": "http.response.body", "body": b"Silas Health Link is Ready!"})
 
 if __name__ == "__main__":
     import uvicorn

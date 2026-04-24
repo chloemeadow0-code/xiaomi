@@ -44,19 +44,27 @@ def get_health_data():
         except Exception as e: print(f"步数报错: {e}")
 
         # --- 通道 2: 捞睡眠 (过去24小时的所有睡眠全加起来) ---
+        # --- 通道 2: 捞睡眠 (改用 Sessions 接口抓取整段会话) ---
         try:
-            res_sleep = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
-                "aggregateBy": [{"dataTypeName": "com.google.sleep.segment"}],
-                "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
-                "startTimeMillis": start_ms, "endTimeMillis": end_ms
-            }).json()
-            sleep_sec = 0
-            for b in res_sleep.get("bucket", []):
-                for d in b.get("dataset", []):
-                    for p in d.get("point", []):
-                        sleep_sec += (int(p["endTimeNanos"]) - int(p["startTimeNanos"])) / 1e9
-            data["sleep"] = round(sleep_sec / 3600, 1)
-        except Exception as e: print(f"睡眠报错: {e}")
+            # Sessions 接口需要 RFC3339 格式的时间字符串
+            start_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(start_ms / 1000))
+            end_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(end_ms / 1000))
+            
+            # activityType=72 专门代表睡眠
+            session_url = f"https://www.googleapis.com/fitness/v1/users/me/sessions?startTime={start_str}&endTime={end_str}&activityType=72"
+            res_sleep = requests.get(session_url, headers=headers).json()
+            
+            sleep_ms = 0
+            # 遍历所有符合条件的睡眠会话
+            for session in res_sleep.get("session", []):
+                s_start = int(session.get("startTimeMillis", 0))
+                s_end = int(session.get("endTimeMillis", 0))
+                if s_start and s_end:
+                    sleep_ms += (s_end - s_start)
+            
+            data["sleep"] = round(sleep_ms / (1000 * 3600), 1)
+        except Exception as e: 
+            print(f"睡眠报错: {e}")
 
         # --- 通道 3: 捞心率 (取24小时内的最新一个值) ---
         try:

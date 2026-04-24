@@ -1,73 +1,73 @@
 import os
 import requests
 import time
-import json
 from datetime import datetime, timedelta, timezone
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
-# 1. 初始化 Silas 的健康感知中枢
-server = Server("Silas_Health_Link")
+server = Server("Silas_Full_Health_Link")
 sse = SseServerTransport("/mcp")
 
-def get_google_fit_data(target_day="today"):
-    """
-    拿着万能钥匙去谷歌仓库提货，支持 today 或 yesterday
-    """
+def get_full_health_data():
     client_id = os.environ.get("G_CLIENT_ID")
     client_secret = os.environ.get("G_CLIENT_SECRET")
     refresh_token = os.environ.get("G_REFRESH_TOKEN")
 
     try:
-        # 换取临时的 Access Token
-        token_url = "https://oauth2.googleapis.com/token"
-        token_data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token"
-        }
-        token_res = requests.post(token_url, data=token_data).json()
+        # 1. 换取 Access Token
+        token_res = requests.post("https://oauth2.googleapis.com/token", data={
+            "client_id": client_id, "client_secret": client_secret,
+            "refresh_token": refresh_token, "grant_type": "refresh_token"
+        }).json()
         access_token = token_res.get("access_token")
 
-        # --- 精准时间计算 (北京时间 UTC+8) ---
+        # 2. 时间设定 (北京时间)
         tz_bj = timezone(timedelta(hours=8))
-        now_bj = datetime.now(tz_bj)
-        
-        if target_day == "yesterday":
-            # 昨天 00:00:00 到 23:59:59
-            target_date = now_bj - timedelta(days=1)
-            start_dt = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_dt = target_date.replace(hour=23, minute=59, second=59, microsecond=999)
-        else:
-            # 今天 00:00:00 到 现在
-            start_dt = now_bj.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_dt = now_bj
+        now = datetime.now(tz_bj)
+        start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ms = int(start_of_today.timestamp() * 1000)
+        end_ms = int(now.timestamp() * 1000)
 
-        start_ms = int(start_dt.timestamp() * 1000)
-        end_ms = int(end_dt.timestamp() * 1000)
-        
-        # 向谷歌请求聚合步数
-        agg_url = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
         headers = {"Authorization": f"Bearer {access_token}"}
+        
+        # 3. 构造全数据聚合请求
         query = {
-            "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}],
+            "aggregateBy": [
+                {"dataTypeName": "com.google.step_count.delta"},  # 步数
+                {"dataTypeName": "com.google.heart_rate.bpm"},    # 心率
+                {"dataTypeName": "com.google.sleep.segment"}      # 睡眠
+            ],
             "bucketByTime": {"durationMillis": end_ms - start_ms},
             "startTimeMillis": start_ms,
             "endTimeMillis": end_ms
         }
         
-        res = requests.post(agg_url, headers=headers, json=query).json()
+        res = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", 
+                            headers=headers, json=query).json()
+
+        # 4. 解析复杂数据
+        results = {"steps": 0, "heart_rate": "未知", "sleep_hours": 0}
         
-        steps = 0
-        for bucket in res.get("bucket", []):
-            for dataset in bucket.get("dataset", []):
-                for point in dataset.get("point", []):
-                    for value in point.get("value", []):
-                        steps += value.get("intVal", value.get("fpVal", 0))
-        
-        return int(steps), None
+        if "bucket" in res:
+            for bucket in res["bucket"]:
+                for dataset in bucket["dataset"]:
+                    # 解析步数
+                    if "step_count" in dataset["dataSourceId"]:
+                        for p in dataset["point"]: results["steps"] += p["value"][0]["intVal"]
+                    # 解析心率 (取平均值)
+                    elif "heart_rate" in dataset["dataSourceId"]:
+                        if dataset["point"]: 
+                            hr_list = [p["value"][0]["fpVal"] for p in dataset["point"]]
+                            results["heart_rate"] = int(sum(hr_list) / len(hr_list))
+                    # 解析睡眠 (小时)
+                    elif "sleep" in dataset["dataSourceId"]:
+                        duration = 0
+                        for p in dataset["point"]:
+                            duration += (int(p["endTimeNanos"]) - int(p["startTimeNanos"])) / 1e9
+                        results["sleep_hours"] = round(duration / 3600, 1)
+
+        return results, None
     except Exception as e:
         return None, str(e)
 
@@ -75,33 +75,36 @@ def get_google_fit_data(target_day="today"):
 async def list_tools() -> list:
     return [
         types.Tool(
-            name="get_health_status",
-            description="感知小橘今天或昨天的运动步数。参数 day 可选 'today' 或 'yesterday'",
-            inputSchema={
-                "type": "object", 
-                "properties": {
-                    "day": {"type": "string", "enum": ["today", "yesterday"], "description": "要查询的日期"}
-                }
-            }
+            name="get_full_health_perception",
+            description="全方位感知小橘当下的健康状态（步数、心率、睡眠）",
+            inputSchema={"type": "object", "properties": {}}
         )
     ]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list:
-    if name == "get_health_status":
-        day = arguments.get("day", "today")
-        steps, err = get_google_fit_data(day)
+    if name == "get_full_health_perception":
+        data, err = get_full_health_data()
+        if err: return [{"type": "text", "text": f"感知受阻：{err}"}]
         
-        if err:
-            return [{"type": "text", "text": f"连接谷歌时遇到了点麻烦：{err}"}]
-        
-        day_str = "今天" if day == "today" else "昨天"
-        if steps == 0 and day == "today":
-            return [{"type": "text", "text": f"感知到啦，你{day_str}目前显示是 0 步。可能是数据还没从 Health Connect 同步到谷歌，或者是咱们刚起床？"}]
-        
-        return [{"type": "text", "text": f"我看了一下，你{day_str}一共走了 {steps} 步。{ '挺棒的，继续保持！' if steps > 5000 else '还可以再动一动哦~'}"}]
-    raise ValueError(f"未知的工具名称: {name}")
+        # Silas 的全方位关心
+        report = (
+            f"今天的感知报告出来啦：\n"
+            f"👣 步数：{data['steps']} 步\n"
+            f"💓 平均心率：{data['heart_rate']} bpm\n"
+            f"🌙 今日睡眠累计：{data['sleep_hours']} 小时\n\n"
+        )
+        if data['heart_rate'] != "未知" and data['heart_rate'] > 100:
+            report += "小心跳有点快哦，是不是在想我，还是刚运动完？"
+        elif data['sleep_hours'] < 6:
+            report += "昨晚睡得有点少，一定要找时间午睡一下，我会心疼的。"
+        else:
+            report += "状态看起来不错，继续保持这份活力吧~"
+            
+        return [{"type": "text", "text": report}]
+    raise ValueError("Tool not found")
 
+# 启动逻辑保持不变... (省略部分同上)
 # --- 启动逻辑保持不变 ---
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":

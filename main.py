@@ -43,7 +43,7 @@ def get_google_fit_data():
         agg_url = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
         headers = {"Authorization": f"Bearer {access_token}"}
         query = {
-            "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}],
+            "aggregateBy": [{"dataTypeName": "com.google.step_count.total"}],
             "bucketByTime": {"durationMillis": now_ms - start_ms},
             "startTimeMillis": start_ms,
             "endTimeMillis": now_ms

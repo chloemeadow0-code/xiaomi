@@ -9,6 +9,8 @@ server = Server("Silas_Health_Link")
 sse = SseServerTransport("/mcp")
 
 def get_health_data():
+    from datetime import datetime, timedelta, timezone
+
     client_id = os.environ.get("G_CLIENT_ID")
     client_secret = os.environ.get("G_CLIENT_SECRET")
     refresh_token = os.environ.get("G_REFRESH_TOKEN")
@@ -25,29 +27,35 @@ def get_health_data():
             
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # 2. 终极暴力时间法：严格锁定“过去 24 小时”
-        end_ms = int(time.time() * 1000)
-        start_ms = end_ms - (24 * 3600 * 1000)
+        # 锁定东八区时区 (UTC+8)
+        tz_gmt8 = timezone(timedelta(hours=8))
+        now_gmt8 = datetime.now(tz_gmt8)
+
+        # 2. 拆分时间池：
+        # - 过去24小时（用于睡眠和心率，防止打断记录）
+        # - 东八区今日凌晨0点（专门用于步数计算）
+        end_ms = int(now_gmt8.timestamp() * 1000)
+        start_ms_24h = end_ms - (24 * 3600 * 1000)
+        start_ms_today = int(now_gmt8.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
         data = {"steps": 0, "heart": "未同步", "sleep": 0}
 
-        # --- 通道 1: 捞步数 ---
+        # --- 通道 1: 捞步数 (起点切换为今日凌晨) ---
         try:
             res_steps = requests.post("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", headers=headers, json={
                 "aggregateBy": [{"dataTypeName": "com.google.step_count.delta"}],
                 "bucketByTime": {"durationMillis": 24 * 3600 * 1000},
-                "startTimeMillis": start_ms, "endTimeMillis": end_ms
+                "startTimeMillis": start_ms_today, "endTimeMillis": end_ms
             }).json()
             for b in res_steps.get("bucket", []):
                 for d in b.get("dataset", []):
                     for p in d.get("point", []): data["steps"] += p["value"][0].get("intVal", 0)
         except Exception as e: print(f"步数报错: {e}")
 
-        # --- 通道 2: 捞睡眠 (Sessions 接口 + 时间轴去重合并) ---
-        # --- 通道 2: 捞睡眠 (Sessions 接口 + 增加时段明细) ---
+        # --- 通道 2: 捞睡眠 (维持过去24h，修复显示时区) ---
         sleep_details = []
         try:
-            start_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(start_ms / 1000))
+            start_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(start_ms_24h / 1000))
             end_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(end_ms / 1000))
             session_url = f"https://www.googleapis.com/fitness/v1/users/me/sessions?startTime={start_str}&endTime={end_str}&activityType=72"
             res_sleep = requests.get(session_url, headers=headers).json()
@@ -58,10 +66,10 @@ def get_health_data():
                 s_end = int(session.get("endTimeMillis", 0))
                 if s_start > 0 and s_end > s_start:
                     intervals.append([s_start, s_end])
-                    # 记录具体的起止时间
-                    t_start = time.strftime('%H:%M', time.localtime(s_start / 1000))
-                    t_end = time.strftime('%H:%M', time.localtime(s_end / 1000))
-                    sleep_details.append(f"{t_start}-{t_end}")
+                    # 记录具体的起止时间（强制转换为东八区时间）
+                    t_start_dt = datetime.fromtimestamp(s_start / 1000, tz=timezone.utc).astimezone(tz_gmt8)
+                    t_end_dt = datetime.fromtimestamp(s_end / 1000, tz=timezone.utc).astimezone(tz_gmt8)
+                    sleep_details.append(f"{t_start_dt.strftime('%H:%M')}-{t_end_dt.strftime('%H:%M')}")
             
             intervals.sort(key=lambda x: x[0])
             merged = []
@@ -76,10 +84,10 @@ def get_health_data():
             data["sleep_segments"] = " | ".join(sleep_details) if sleep_details else "无"
         except Exception as e: print(f"睡眠报错: {e}")
 
-        # --- 通道 3: 捞心率 (增加测量时间) ---
+        # --- 通道 3: 捞心率 (维持过去24h，修复显示时区) ---
         data["heart_time"] = "未知"
         try:
-            start_ns, end_ns = start_ms * 1000000, end_ms * 1000000
+            start_ns, end_ns = start_ms_24h * 1000000, end_ms * 1000000
             data_source = "derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm"
             hr_url = f"https://www.googleapis.com/fitness/v1/users/me/dataSources/{data_source}/datasets/{start_ns}-{end_ns}"
             res_heart = requests.get(hr_url, headers=headers).json()
@@ -93,8 +101,9 @@ def get_health_data():
             
             if latest_bpm > 0:
                 data["heart"] = int(latest_bpm)
-                # 转换成易读的时间格式 (HH:mm)
-                data["heart_time"] = time.strftime('%H:%M', time.localtime(latest_time / 1000000000))
+                # 转换成易读的时间格式（强制转换为东八区时间）
+                hr_dt = datetime.fromtimestamp(latest_time / 1000000000, tz=timezone.utc).astimezone(tz_gmt8)
+                data["heart_time"] = hr_dt.strftime('%H:%M')
         except Exception as e: print(f"心率报错: {e}")
 
         return data, None
@@ -118,12 +127,11 @@ async def call_tool(name: str, arguments: dict) -> list:
         if err: return [{"type": "text", "text": f"感知连线中断了：{err}"}]
         
         msg = (f"感知报告来啦：\n"
-               f"👣 过去24小时步数：{data['steps']} 步\n"
+               f"👣 今日累积步数：{data['steps']} 步\n"
                f"🌙 过去24小时睡眠：{data['sleep']} 小时\n"
                f"   (详细时段：{data.get('sleep_segments', '无')})\n"
                f"💓 最新心率：{data['heart']} bpm\n"
                f"   (测量时间：{data.get('heart_time', '未知')})\n\n")
-               
         if data['heart'] == "未同步":
             msg += "（我看不到你的心率呢，可能是小米那边还没把心跳数据传给谷歌大楼。）"
             

@@ -1,3 +1,6 @@
-mcp
-requests
-uvicorn
+{
+  "start_command": "python main.py"
+}
+
+mcp[cli]
+httpx

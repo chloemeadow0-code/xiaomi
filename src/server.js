@@ -9,7 +9,13 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
+app.get('/', (req, res) => {
+  res.send('health webhook running!');
+});
+
 app.post('/webhook', async (req, res) => {
+  console.log('收到数据：', JSON.stringify(req.body));
+  
   const { data_type, value, recorded_at } = req.body;
   
   const { error } = await supabase
@@ -21,12 +27,13 @@ app.post('/webhook', async (req, res) => {
       recorded_at: recorded_at || new Date().toISOString()
     });
 
-  if (error) return res.status(500).json({ error });
+  if (error) {
+    console.log('写入失败：', error);
+    return res.status(500).json({ error });
+  }
+  
+  console.log('写入成功！');
   res.json({ success: true });
-});
-
-app.get('/', (req, res) => {
-  res.send('health webhook running!');
 });
 
 const PORT = process.env.PORT || 3000;

@@ -29,4 +29,5 @@ app.get('/', (req, res) => {
   res.send('health webhook running!');
 });
 
-app.listen(3000, () => console.log('running on 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('running on ' + PORT));

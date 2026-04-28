@@ -1,7 +1,3 @@
-
-  console.log(req.body);  // ← 加这行
-  
-
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -30,11 +26,15 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
+  console.log('=== 原始 body ===');
+  console.log(req.body);
+  console.log('================');
+
   let body;
   try {
     const cleaned = sanitizeJson(req.body);
     body = JSON.parse(cleaned);
-    console.log('收到完整数据：', JSON.stringify(body));
+    console.log('解析后数据：', JSON.stringify(body));
   } catch (e) {
     console.log('JSON 解析失败：', e.message);
     console.log('原始 body：', req.body);

@@ -1,3 +1,8 @@
+app.post('/webhook', async (req, res) => {
+  console.log('=== 原始 body ===');
+  console.log(req.body);  // ← 加这行
+  console.log('================');
+
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 

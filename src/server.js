@@ -2,17 +2,26 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json());
+
+// ✅ 先用 text 接收原始 body，不用 express.json()
+app.use(express.text({ type: 'application/json', limit: '1mb' }));
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
 
-// 将任意值统一转成数组
 function toArray(val) {
   if (val === undefined || val === null) return [];
   return Array.isArray(val) ? val : [val];
+}
+
+// ✅ 清洗残缺 JSON：把 `: ,` `: }` `: ]` 替换为 `: null`
+function sanitizeJson(raw) {
+  return raw
+    .replace(/:[ \t]*,/g, ': null,')   // "key": ,  →  "key": null,
+    .replace(/:[ \t]*}/g, ': null}')   // "key": }  →  "key": null}
+    .replace(/:[ \t]*]/g, ': null]');  // "key": ]  →  "key": null]
 }
 
 app.get('/', (req, res) => {
@@ -20,73 +29,84 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  console.log('收到完整数据：', JSON.stringify(req.body));
+  let body;
+  try {
+    const cleaned = sanitizeJson(req.body);
+    body = JSON.parse(cleaned);
+    console.log('收到完整数据：', JSON.stringify(body));
+  } catch (e) {
+    console.log('JSON 解析失败：', e.message);
+    console.log('原始 body：', req.body);
+    return res.status(400).json({ error: 'invalid json', detail: e.message });
+  }
+
   const rows = [];
 
-  for (const s of toArray(req.body.steps)) {
+  for (const s of toArray(body.steps)) {
     rows.push({
-      user_id: 'xiaoju',
-      data_type: 'steps',
+      user_id: 'xiaoju', data_type: 'steps',
       value: s.count ?? s.value,
       recorded_at: s.start_time ?? s.timestamp ?? s.time
     });
   }
 
-  for (const s of toArray(req.body.sleep)) {
+  for (const s of toArray(body.sleep)) {
     rows.push({
-      user_id: 'xiaoju',
-      data_type: 'sleep',
+      user_id: 'xiaoju', data_type: 'sleep',
       value: s.duration_seconds ?? s.value,
       recorded_at: s.session_end_time ?? s.timestamp ?? s.time
     });
   }
 
-  // ✅ 核心修复：heart_rate 可能是数字、对象、或数组
-  for (const h of toArray(req.body.heart_rate)) {
+  for (const h of toArray(body.heart_rate)) {
+    if (h === null) continue; // 跳过空值
     const value = typeof h === 'number' ? h : (h.bpm ?? h.value ?? h.rate ?? h.heart_rate);
     const recorded_at = typeof h === 'number'
-      ? (req.body.timestamp ?? new Date().toISOString())
-      : (h.start_time ?? h.timestamp ?? h.time);
+      ? (body.timestamp ?? new Date().toISOString())
+      : (h.start_time ?? h.timestamp ?? h.time ?? body.timestamp ?? new Date().toISOString());
+    if (value == null) continue; // 值也是空，跳过
     rows.push({ user_id: 'xiaoju', data_type: 'heart_rate', value, recorded_at });
   }
 
-  const spo2Raw = req.body.blood_oxygen ?? req.body.spo2 ?? req.body.oxygen_saturation;
+  const spo2Raw = body.blood_oxygen ?? body.spo2 ?? body.oxygen_saturation;
   for (const s of toArray(spo2Raw)) {
+    if (s === null) continue;
     const value = typeof s === 'number' ? s : (s.percentage ?? s.value ?? s.spo2);
     const recorded_at = typeof s === 'number'
-      ? (req.body.timestamp ?? new Date().toISOString())
-      : (s.start_time ?? s.timestamp ?? s.time);
+      ? (body.timestamp ?? new Date().toISOString())
+      : (s.start_time ?? s.timestamp ?? s.time ?? body.timestamp ?? new Date().toISOString());
+    if (value == null) continue;
     rows.push({ user_id: 'xiaoju', data_type: 'blood_oxygen', value, recorded_at });
   }
 
-  for (const w of toArray(req.body.weight)) {
+  for (const w of toArray(body.weight)) {
+    if (w === null) continue;
     rows.push({
-      user_id: 'xiaoju',
-      data_type: 'weight',
+      user_id: 'xiaoju', data_type: 'weight',
       value: w.weight ?? w.value ?? w.kg,
-      recorded_at: w.start_time ?? w.timestamp ?? w.time
+      recorded_at: w.start_time ?? w.timestamp ?? w.time ?? body.timestamp ?? new Date().toISOString()
     });
   }
 
-  for (const b of toArray(req.body.blood_pressure)) {
+  for (const b of toArray(body.blood_pressure)) {
+    if (b === null) continue;
     rows.push({
-      user_id: 'xiaoju',
-      data_type: 'blood_pressure',
+      user_id: 'xiaoju', data_type: 'blood_pressure',
       value: JSON.stringify({ systolic: b.systolic, diastolic: b.diastolic }),
-      recorded_at: b.start_time ?? b.timestamp ?? b.time
+      recorded_at: b.start_time ?? b.timestamp ?? b.time ?? body.timestamp ?? new Date().toISOString()
     });
   }
 
-  // 未知字段兜底（只处理数组类型）
+  // 未知字段兜底
   const knownKeys = ['timestamp', 'app_version', 'steps', 'sleep', 'heart_rate',
     'blood_oxygen', 'spo2', 'oxygen_saturation', 'weight', 'blood_pressure'];
-  for (const key of Object.keys(req.body)) {
-    if (!knownKeys.includes(key) && Array.isArray(req.body[key]) && req.body[key].length > 0) {
-      console.log('发现未知数据类型：', key, JSON.stringify(req.body[key][0]));
-      for (const item of req.body[key]) {
+  for (const key of Object.keys(body)) {
+    if (!knownKeys.includes(key) && Array.isArray(body[key]) && body[key].length > 0) {
+      console.log('发现未知数据类型：', key, JSON.stringify(body[key][0]));
+      for (const item of body[key]) {
+        if (item === null) continue;
         rows.push({
-          user_id: 'xiaoju',
-          data_type: key,
+          user_id: 'xiaoju', data_type: key,
           value: item.value ?? item.count ?? item.bpm ?? item.rate ?? item.percentage ?? JSON.stringify(item),
           recorded_at: item.start_time ?? item.timestamp ?? item.time ?? new Date().toISOString()
         });
